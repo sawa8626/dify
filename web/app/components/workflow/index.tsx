@@ -9,10 +9,10 @@ import {
   useRef,
   useState,
 } from 'react'
+import useSWR from 'swr'
 import { setAutoFreeze } from 'immer'
 import {
   useEventListener,
-  useKeyPress,
 } from 'ahooks'
 import ReactFlow, {
   Background,
@@ -34,6 +34,10 @@ import type {
   EnvironmentVariable,
   Node,
 } from './types'
+import {
+  ControlMode,
+  SupportUploadFileTypes,
+} from './types'
 import { WorkflowContextProvider } from './context'
 import {
   useDSL,
@@ -43,16 +47,18 @@ import {
   useNodesSyncDraft,
   usePanelInteractions,
   useSelectionInteractions,
+  useShortcuts,
   useWorkflow,
   useWorkflowInit,
   useWorkflowReadOnly,
-  useWorkflowStartRun,
   useWorkflowUpdate,
 } from './hooks'
 import Header from './header'
 import CustomNode from './nodes'
 import CustomNoteNode from './note-node'
 import { CUSTOM_NOTE_NODE } from './note-node/constants'
+import CustomIterationStartNode from './nodes/iteration-start'
+import { CUSTOM_ITERATION_START_NODE } from './nodes/iteration-start/constants'
 import Operator from './operator'
 import CustomEdge from './custom-edge'
 import CustomConnectionLine from './custom-connection-line'
@@ -65,15 +71,14 @@ import NodeContextmenu from './node-contextmenu'
 import SyncingDataModal from './syncing-data-modal'
 import UpdateDSLModal from './update-dsl-modal'
 import DSLExportConfirmModal from './dsl-export-confirm-modal'
+import LimitTips from './limit-tips'
 import {
   useStore,
   useWorkflowStore,
 } from './store'
 import {
-  getKeyboardKeyCodeBySystem,
   initialEdges,
   initialNodes,
-  isEventTargetInputArea,
 } from './utils'
 import {
   CUSTOM_NODE,
@@ -81,17 +86,20 @@ import {
   ITERATION_CHILDREN_Z_INDEX,
   WORKFLOW_DATA_UPDATE,
 } from './constants'
-import { WorkflowHistoryProvider, useWorkflowHistoryStore } from './workflow-history-store'
+import { WorkflowHistoryProvider } from './workflow-history-store'
 import Loading from '@/app/components/base/loading'
 import { FeaturesProvider } from '@/app/components/base/features'
 import type { Features as FeaturesData } from '@/app/components/base/features/types'
 import { useFeaturesStore } from '@/app/components/base/features/hooks'
 import { useEventEmitterContextContext } from '@/context/event-emitter'
 import Confirm from '@/app/components/base/confirm'
+import { FILE_EXTS } from '@/app/components/base/prompt-editor/constants'
+import { fetchFileUploadConfig } from '@/service/common'
 
 const nodeTypes = {
   [CUSTOM_NODE]: CustomNode,
   [CUSTOM_NOTE_NODE]: CustomNoteNode,
+  [CUSTOM_ITERATION_START_NODE]: CustomIterationStartNode,
 }
 const edgeTypes = {
   [CUSTOM_NODE]: CustomEdge,
@@ -171,6 +179,7 @@ const Workflow: FC<WorkflowProps> = memo(({
     return () => {
       handleSyncWorkflowDraft(true, true)
     }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
   const { handleRefreshWorkflowDraft } = useWorkflowUpdate()
@@ -225,17 +234,12 @@ const Workflow: FC<WorkflowProps> = memo(({
     handleNodeConnectStart,
     handleNodeConnectEnd,
     handleNodeContextMenu,
-    handleNodesCopy,
-    handleNodesPaste,
-    handleNodesDuplicate,
-    handleNodesDelete,
     handleHistoryBack,
     handleHistoryForward,
   } = useNodesInteractions()
   const {
     handleEdgeEnter,
     handleEdgeLeave,
-    handleEdgeDelete,
     handleEdgesChange,
   } = useEdgesInteractions()
   const {
@@ -250,7 +254,6 @@ const Workflow: FC<WorkflowProps> = memo(({
   const {
     isValidConnection,
   } = useWorkflow()
-  const { handleStartWorkflowRun } = useWorkflowStartRun()
   const {
     exportCheck,
     handleExportDSL,
@@ -262,41 +265,7 @@ const Workflow: FC<WorkflowProps> = memo(({
     },
   })
 
-  const { shortcutsEnabled: workflowHistoryShortcutsEnabled } = useWorkflowHistoryStore()
-
-  useKeyPress(['delete', 'backspace'], (e) => {
-    if (isEventTargetInputArea(e.target as HTMLElement))
-      return
-
-    handleNodesDelete()
-  })
-  useKeyPress(['delete', 'backspace'], handleEdgeDelete)
-  useKeyPress(`${getKeyboardKeyCodeBySystem('ctrl')}.c`, (e) => {
-    if (isEventTargetInputArea(e.target as HTMLElement))
-      return
-
-    handleNodesCopy()
-  }, { exactMatch: true, useCapture: true })
-  useKeyPress(`${getKeyboardKeyCodeBySystem('ctrl')}.v`, (e) => {
-    if (isEventTargetInputArea(e.target as HTMLElement))
-      return
-
-    handleNodesPaste()
-  }, { exactMatch: true, useCapture: true })
-  useKeyPress(`${getKeyboardKeyCodeBySystem('ctrl')}.d`, handleNodesDuplicate, { exactMatch: true, useCapture: true })
-  useKeyPress(`${getKeyboardKeyCodeBySystem('alt')}.r`, handleStartWorkflowRun, { exactMatch: true, useCapture: true })
-  useKeyPress(`${getKeyboardKeyCodeBySystem('alt')}.r`, handleStartWorkflowRun, { exactMatch: true, useCapture: true })
-  useKeyPress(
-    `${getKeyboardKeyCodeBySystem('ctrl')}.z`,
-    () => workflowHistoryShortcutsEnabled && handleHistoryBack(),
-    { exactMatch: true, useCapture: true },
-  )
-
-  useKeyPress(
-    [`${getKeyboardKeyCodeBySystem('ctrl')}.y`, `${getKeyboardKeyCodeBySystem('ctrl')}.shift.z`],
-    () => workflowHistoryShortcutsEnabled && handleHistoryForward(),
-    { exactMatch: true, useCapture: true },
-  )
+  useShortcuts()
 
   const store = useStoreApi()
   if (process.env.NODE_ENV === 'development') {
@@ -357,6 +326,7 @@ const Workflow: FC<WorkflowProps> = memo(({
           />
         )
       }
+      <LimitTips />
       <ReactFlow
         nodeTypes={nodeTypes}
         edgeTypes={edgeTypes}
@@ -388,14 +358,14 @@ const Workflow: FC<WorkflowProps> = memo(({
         nodesConnectable={!nodesReadOnly}
         nodesFocusable={!nodesReadOnly}
         edgesFocusable={!nodesReadOnly}
-        panOnDrag={controlMode === 'hand' && !workflowReadOnly}
+        panOnDrag={controlMode === ControlMode.Hand && !workflowReadOnly}
         zoomOnPinch={!workflowReadOnly}
         zoomOnScroll={!workflowReadOnly}
         zoomOnDoubleClick={!workflowReadOnly}
         isValidConnection={isValidConnection}
         selectionKeyCode={null}
         selectionMode={SelectionMode.Partial}
-        selectionOnDrag={controlMode === 'pointer' && !workflowReadOnly}
+        selectionOnDrag={controlMode === ControlMode.Pointer && !workflowReadOnly}
         minZoom={0.25}
       >
         <Background
@@ -414,6 +384,7 @@ const WorkflowWrap = memo(() => {
     data,
     isLoading,
   } = useWorkflowInit()
+  const { data: fileUploadConfigResponse } = useSWR({ url: '/files/upload' }, fetchFileUploadConfig)
 
   const nodesData = useMemo(() => {
     if (data)
@@ -440,10 +411,16 @@ const WorkflowWrap = memo(() => {
   const initialFeatures: FeaturesData = {
     file: {
       image: {
-        enabled: !!features.file_upload?.image.enabled,
-        number_limits: features.file_upload?.image.number_limits || 3,
-        transfer_methods: features.file_upload?.image.transfer_methods || ['local_file', 'remote_url'],
+        enabled: !!features.file_upload?.image?.enabled,
+        number_limits: features.file_upload?.image?.number_limits || 3,
+        transfer_methods: features.file_upload?.image?.transfer_methods || ['local_file', 'remote_url'],
       },
+      enabled: !!(features.file_upload?.enabled || features.file_upload?.image?.enabled),
+      allowed_file_types: features.file_upload?.allowed_file_types || [SupportUploadFileTypes.image],
+      allowed_file_extensions: features.file_upload?.allowed_file_extensions || FILE_EXTS[SupportUploadFileTypes.image].map(ext => `.${ext}`),
+      allowed_file_upload_methods: features.file_upload?.allowed_file_upload_methods || features.file_upload?.image?.transfer_methods || ['local_file', 'remote_url'],
+      number_limits: features.file_upload?.number_limits || features.file_upload?.image?.number_limits || 3,
+      fileUploadConfig: fileUploadConfigResponse,
     },
     opening: {
       enabled: !!features.opening_statement,
